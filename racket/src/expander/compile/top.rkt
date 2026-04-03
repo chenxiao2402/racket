@@ -48,6 +48,9 @@
 
    (define mpis (make-module-path-index-table))
    (define purely-functional? #t)
+   
+
+   (define bodys (flatten-begin p))
 
    ;; Compile the body forms, similar to compiling the body of a module
    (define-values (body-linklets
@@ -58,7 +61,7 @@
                    phase-to-link-extra-inspectorss
                    syntax-literals
                    no-root-context-pos)
-     (compile-forms (flatten-begin p) cctx mpis
+     (compile-forms bodys cctx mpis
                     #:body-imports (if single-expression?
                                        `([]
                                          [,syntax-literals-id]
