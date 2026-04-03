@@ -1,6 +1,7 @@
 #lang racket/base
 (require "match.rkt"
-         "wrap.rkt")
+         "wrap.rkt"
+         "known.rkt")
 
 (provide apply-cse)
 
@@ -15,7 +16,7 @@
           (pair? (car lst2)) (eq? 'seq (car (car lst2))))
      (let ([n1 (cadr (car lst1))]
            [n2 (cadr (car lst2))])
-       (cons `(seq ,(min n1 n2)) (common-scope (cdr lst1) (cdr lst2))))]
+       (list `(seq ,(min n1 n2))))]
     [else '()]))
 
 
@@ -40,11 +41,23 @@
 ;; ============================================================
 ;; Main entry point
 
-(define (apply-cse body)
-  (map cse-single body))
+(define (apply-cse body prim-knowns)
+  (map (lambda (form) (cse-single form prim-knowns)) body))
 
 
-(define (cse-single form)
+(struct cse-defval (bindings inst) #:transparent)
+
+(define (cse-single form prim-knowns)
+
+  (define (pure-rator? rator)
+    (let ([r (unwrap rator)])
+      (and (symbol? r)
+           (let ([v (hash-ref prim-knowns r #f)])
+             (and v
+                  (or (known-procedure/pure? v)
+                      (known-procedure/allocates? v)
+                      (known-procedure/folding? v)
+                      (known-procedure/then-pure? v)))))))
 
   (define impure-ids (make-hash))
   (define expr2sym (make-hash))
@@ -57,21 +70,28 @@
   ;; --------------------------------------------------------
   ;; Generic traversal with result-handler callback
   ;;
-  ;; `result-handler` is called as (result-handler new-expr impurity scope)
+  ;; `result-handler` is called as (result-handler new-expr purity scope)
   ;; and must return a list of forms (usually `(list expr)`, or
   ;; `(list def ... expr)` when splicing bindings at a seq position).
 
   (define (concat-insts subexprs)
     (match subexprs
-      [`(,e . ,es) (if (list? e)
-                       (append e (concat-insts es))
+      [`(,e . ,es) (if (cse-defval? e)
+                       (list `(let-values ,(cse-defval-bindings e)
+                                ,@(cons (cse-defval-inst e) (concat-insts es))))
                        (cons e (concat-insts es)))]
       [`() '()]))
 
-  (define (subexprs-impurity subexprs)
-    (for/or ([se (in-list subexprs)])
-      (let ([sym (hash-ref expr2sym se #f)])
-        (and sym (hash-ref sym-impure sym #f)))))
+  (define (primitive? v)
+    (or (number? v) (boolean? v) (string? v) (char? v) (bytes? v)))
+
+  (define (subexprs-purity subexprs)
+    (for/and ([se (in-list subexprs)])
+      (cond
+        [(primitive? se) #t]
+        [(symbol? se) (not (hash-ref sym-impure se #f))]
+        [(hash-ref expr2sym se #f) => (lambda (sym) (not (hash-ref sym-impure sym #f)))]
+        [else #f])))
 
   (define (traverse-expr! e scope result-handler)
     (define (traverse-subexpr sub idx)
@@ -83,101 +103,109 @@
                       (define new-scp (if seq? `(seq ,i) i))
                       (traverse-expr! sub (scp-ext scope new-scp) result-handler))))
 
-    (if (and (symbol? e) (hash-has-key? sym2expr e))
-        (traverse-expr! (hash-ref sym2expr e) scope result-handler)
-        (match e
-          [`(lambda ,formals ,body ...)
-           (let* ([new-body (traverse-subexprs body 0 #t)]
-                  [new-e `(lambda ,formals ,@new-body)]
-                  [impurity (subexprs-impurity new-body)])
-             (result-handler new-e impurity scope))]
-          [`(case-lambda [,formalss ,bodys ...] ...)
-           (let* ([new-clauses
-                   (for/list ([formals (in-list formalss)]
-                              [body (in-list bodys)]
-                              [i (in-naturals)])
-                     (define clause-body
-                       (concat-insts (for/list ([b (in-list body)]
-                                                [j (in-naturals)])
-                                       (traverse-expr! b (scp-ext (scp-ext scope i) `(seq ,j))
-                                                       result-handler))))
-                     `(,formals ,@clause-body))]
-                  [new-e `(case-lambda ,@new-clauses)]
-                  [impurity #f])
-             (result-handler new-e impurity scope))]
-          [`(define-values ,ids ,rhs)
-           (let* ([new-rhs (traverse-subexpr rhs 0)]
-                  [new-e `(define-values ,ids ,new-rhs)]
-                  [impurity #t])
-             (result-handler new-e impurity scope))]
-          [`(quote ,_) e]
-          [`(let-values ([,idss ,rhss] ...) ,bodys ...)
-           (let* ([new-clauses
-                   (for/list ([ids (in-list idss)]
-                              [rhs (in-list rhss)]
-                              [i (in-naturals)])
-                     (list ids (traverse-subexpr rhs i)))]
-                  [body-start (length new-clauses)]
-                  [new-body (traverse-subexprs bodys body-start #t)]
-                  [new-e `(let-values ,new-clauses ,@new-body)]
-                  [impurity (or (subexprs-impurity (map cadr new-clauses))
-                                (subexprs-impurity new-body))])
-             (result-handler new-e impurity scope))]
-          [`(letrec-values ([,idss ,rhss] ...) ,bodys ...)
-           (let* ([new-clauses
-                   (for/list ([ids (in-list idss)]
-                              [rhs (in-list rhss)]
-                              [i (in-naturals)])
-                     (list ids (traverse-subexpr rhs i)))]
-                  [body-start (length new-clauses)]
-                  [new-body (traverse-subexprs bodys body-start #t)]
-                  [new-e `(letrec-values ,new-clauses ,@new-body)]
-                  [impurity (or (subexprs-impurity (map cadr new-clauses))
-                                (subexprs-impurity new-body))])
-             (result-handler new-e impurity scope))]
-          [`(if ,tst ,thn ,els)
-           (let* ([new-tst (traverse-subexpr tst 0)]
-                  [new-thn (traverse-subexpr thn 1)]
-                  [new-els (traverse-subexpr els 2)]
-                  [new-e `(if ,new-tst ,new-thn ,new-els)]
-                  [impurity (subexprs-impurity (list new-tst new-thn new-els))])
-             (result-handler new-e impurity scope))]
-          [`(with-continuation-mark ,key ,val ,body)
-           (let* ([new-key (traverse-subexpr key 0)]
-                  [new-val (traverse-subexpr val 1)]
-                  [new-body (traverse-subexpr body 2)]
-                  [new-e `(with-continuation-mark ,new-key ,new-val ,new-body)]
-                  [impurity (subexprs-impurity (list new-key new-val new-body))])
-             (result-handler new-e impurity scope))]
-          [`(begin ,exps ...)
-           (let* ([new-body (traverse-subexprs exps 0 #t)]
-                  [new-e `(begin ,@new-body)]
-                  [impurity (subexprs-impurity new-body)])
-             (result-handler new-e impurity scope))]
-          [`(begin-unsafe ,exps ...)
-           (let* ([new-body (traverse-subexprs exps 0 #t)]
-                  [new-e `(begin-unsafe ,@new-body)]
-                  [impurity (subexprs-impurity new-body)])
-             (result-handler new-e impurity scope))]
-          [`(begin0 ,exps ...)
-           (let* ([new-body (traverse-subexprs exps 0 #t)]
-                  [new-e `(begin0 ,@new-body)]
-                  [impurity (subexprs-impurity new-body)])
-             (result-handler new-e impurity scope))]
-          [`(set! ,id ,rhs)
-           (let* ([new-rhs (traverse-subexpr rhs 0)]
-                  [new-e `(set! ,id ,new-rhs)]
-                  [impurity #t])
-             (result-handler new-e impurity scope))]
-          [`(variable-reference-constant? ,_) e]
-          [`(variable-reference-from-unsafe? ,_) e]
-          [`(#%variable-reference . ,_) e]
-          [`(,rator ,exps ...)
-           (let* ([new-args (traverse-subexprs exps 0 #f)]
-                  [new-e `(,rator ,@new-args)]
-                  [impurity (subexprs-impurity new-args)])
-             (result-handler new-e impurity scope))]
-          [`,_ e])))
+
+
+    (cond
+      [(and (symbol? e) (duplicate-and-pure? e))
+       (result-handler e #t scope)]
+      [(and (symbol? e) (hash-has-key? sym2expr e))
+       (traverse-expr! (hash-ref sym2expr e) scope result-handler)]
+      [else
+       (match e
+         [`(lambda ,formals ,body ...)
+          (let* ([new-body (traverse-subexprs body 0 #t)]
+                 [new-e `(lambda ,formals ,@new-body)]
+                 [purity (subexprs-purity new-body)])
+            (result-handler new-e purity scope))]
+         [`(case-lambda [,formalss ,bodys ...] ...)
+          (let* ([new-clauses
+                  (for/list ([formals (in-list formalss)]
+                             [body (in-list bodys)]
+                             [i (in-naturals)])
+                    (define clause-body
+                      (concat-insts (for/list ([b (in-list body)]
+                                               [j (in-naturals)])
+                                      (traverse-expr! b (scp-ext (scp-ext scope i) `(seq ,j))
+                                                      result-handler))))
+                    `(,formals ,@clause-body))]
+                 [new-e `(case-lambda ,@new-clauses)]
+                 [purity (subexprs-purity (apply append (map cdr new-clauses)))])
+            (result-handler new-e purity scope))]
+         [`(define-values ,ids ,rhs)
+          (let* ([new-rhs (traverse-subexpr rhs 0)]
+                 [new-e `(define-values ,ids ,new-rhs)]
+                 [purity #f])
+            (result-handler new-e purity scope))]
+         [`(quote ,_) e]
+         [`(let-values ([,idss ,rhss] ...) ,bodys ...)
+          (let* ([new-clauses
+                  (for/list ([ids (in-list idss)]
+                             [rhs (in-list rhss)]
+                             [i (in-naturals)])
+                    (list ids (traverse-subexpr rhs i)))]
+                 [body-start (length new-clauses)]
+                 [new-body (traverse-subexprs bodys body-start #t)]
+                 [new-e `(let-values ,new-clauses ,@new-body)]
+                 [purity (and (subexprs-purity (map cadr new-clauses))
+                              (subexprs-purity new-body))])
+            (result-handler new-e purity scope))]
+         [`(letrec-values ([,idss ,rhss] ...) ,bodys ...)
+          (let* ([new-clauses
+                  (for/list ([ids (in-list idss)]
+                             [rhs (in-list rhss)]
+                             [i (in-naturals)])
+                    (list ids (traverse-subexpr rhs i)))]
+                 [body-start (length new-clauses)]
+                 [new-body (traverse-subexprs bodys body-start #t)]
+                 [new-e `(letrec-values ,new-clauses ,@new-body)]
+                 [purity (and (subexprs-purity (map cadr new-clauses))
+                              (subexprs-purity new-body))])
+            (result-handler new-e purity scope))]
+         [`(if ,tst ,thn ,els)
+          (let* ([new-tst (traverse-subexpr tst 0)]
+                 [new-thn (traverse-subexpr thn 1)]
+                 [new-els (traverse-subexpr els 2)]
+                 [new-e `(if ,new-tst ,new-thn ,new-els)]
+                 [purity (subexprs-purity (list new-tst new-thn new-els))])
+            (result-handler new-e purity scope))]
+         [`(with-continuation-mark ,key ,val ,body)
+          (let* ([new-key (traverse-subexpr key 0)]
+                 [new-val (traverse-subexpr val 1)]
+                 [new-body (traverse-subexpr body 2)]
+                 [new-e `(with-continuation-mark ,new-key ,new-val ,new-body)]
+                 [purity (subexprs-purity (list new-key new-val new-body))])
+            (result-handler new-e purity scope))]
+         [`(begin ,exps ...)
+          (let* ([new-body (traverse-subexprs exps 0 #t)]
+                 [new-e `(begin ,@new-body)]
+                 [purity (subexprs-purity new-body)])
+            (result-handler new-e purity scope))]
+         [`(begin-unsafe ,exps ...)
+          (let* ([new-body (traverse-subexprs exps 0 #t)]
+                 [new-e `(begin-unsafe ,@new-body)]
+                 [purity (subexprs-purity new-body)])
+            (result-handler new-e purity scope))]
+         [`(begin0 ,exps ...)
+          (let* ([new-body (traverse-subexprs exps 0 #t)]
+                 [new-e `(begin0 ,@new-body)]
+                 [purity (subexprs-purity new-body)])
+            (result-handler new-e purity scope))]
+         [`(set! ,id ,rhs)
+          (let* ([new-rhs (traverse-subexpr rhs 0)]
+                 [new-e `(set! ,id ,new-rhs)]
+                 [purity #f])
+            (result-handler new-e purity scope))]
+         [`(variable-reference-constant? ,_) e]
+         [`(variable-reference-from-unsafe? ,_) e]
+         [`(#%variable-reference . ,_) e]
+         ;;;  [`(void ,_ ...) e]
+         [`(,rator ,exps ...)
+          (let* ([new-args (traverse-subexprs exps 0 #f)]
+                 [new-e `(,rator ,@new-args)]
+                 [purity (and (pure-rator? rator)
+                              (subexprs-purity new-args))])
+            (result-handler new-e purity scope))]
+         [`,_ e])]))
 
   ;; --------------------------------------------------------
   ;; Pass 1 handler: collect set!-mutated identifiers
@@ -191,7 +219,7 @@
   ;; --------------------------------------------------------
   ;; Pass 2 handler: record expression/scope mappings
 
-  (define (record-expr! expr impurity scp)
+  (define (record-expr! expr purity scp)
     (cond
       [(hash-has-key? expr2sym expr)
        (define sym (hash-ref expr2sym expr))
@@ -203,42 +231,74 @@
        (hash-set! expr2sym expr sym)
        (hash-set! sym2expr sym expr)
        (hash-set! sym2scp sym scp)
-       (hash-set! sym-impure sym impurity)
+       (hash-set! sym-impure sym (not purity))
        sym]))
 
   ;; --------------------------------------------------------
   ;; Build scp2dupsyms mapping
 
+  (define (duplicate-and-pure? sym)
+    (and (hash-has-key? sym-duplicate sym)
+         (not (hash-ref sym-impure sym #f))))
+
   (define (init-scp2dupsyms!)
     (for ([sym (in-hash-keys sym2scp)])
       (define scp (hash-ref sym2scp sym))
-      (when (and (hash-has-key? sym-duplicate sym)
-                 (not (hash-ref sym-impure sym #f)))
+      (when (duplicate-and-pure? sym)
         (hash-set! scp2dupsyms scp
                    (cons sym (hash-ref scp2dupsyms scp '()))))))
 
   ;; --------------------------------------------------------
   ;; Pass 3 handler: reconstruct, inserting bindings for duplicates
 
-  (define (reconstruct expr impurity scp)
+  ;; Expand CSE gensyms in an expression back to original sub-expressions,
+  ;; so the let-values RHS doesn't contain unbound internal gensyms.
+  (define (expand-cse-expr e)
+    (cond
+      [(and (symbol? e) (hash-has-key? sym2expr e))
+       (expand-cse-expr (hash-ref sym2expr e))]
+      [(pair? e) (cons (expand-cse-expr (car e)) (expand-cse-expr (cdr e)))]
+      [else e]))
+
+  (define (reconstruct expr purity scp)
     (define dupsyms (hash-ref scp2dupsyms scp #f))
+
     (if (not dupsyms)
         expr
         (cond
           [(and (pair? scp) (seq-element? (lst-last scp)))
-           (list
-             `(define-values ,dupsyms
-                (values ,@(for/list ([sym (in-list dupsyms)])
-                            (hash-ref sym2expr sym))))
+           (cse-defval
+             (for/list ([sym (in-list dupsyms)])
+               `((,sym) ,(expand-cse-expr (hash-ref sym2expr sym))))
              expr)]
           [else
            `(let-values
               ,(for/list ([sym (in-list dupsyms)])
-                 `((,sym) ,(hash-ref sym2expr sym)))
+                 `((,sym) ,(expand-cse-expr (hash-ref sym2expr sym))))
               ,expr)])))
 
   ;; --------------------------------------------------------
   ;; Run passes
+
+
+
+  (traverse-expr! form '() collect-impure!)
+  (define pass2 (traverse-expr! form '() record-expr!))
+  (init-scp2dupsyms!)
+  (define res (traverse-expr! pass2 '() reconstruct))
+
+
+  ;;; (match form
+  ;;;   [`(call-with-values
+  ;;;       (lambda ()
+  ;;;         (let-values (((x_1) 1))
+  ;;;           (+ (let-values (((y_2) 2))
+  ;;;                (+ (+ (+ y_2 1) (+ y_2 1))
+  ;;;                   (+ x_1 2)))
+  ;;;              (let-values (((z_3) 3))
+  ;;;                (+ z_3 (+ x_1 2))))))
+  ;;;       print-values)
+
 
   (define (deep-unwrap v)
     (cond
@@ -247,12 +307,56 @@
 
   (log-error (format "cse input: ~s" (deep-unwrap form)))
 
-  (traverse-expr! form '() collect-impure!)
-  (traverse-expr! form '() record-expr!)
-  (init-scp2dupsyms!)
-  (define res (traverse-expr! form '() reconstruct))
-
   (log-error (format "cse result: ~s" (deep-unwrap res)))
-  form
+
+  ;;; (log-error (format "+ is pure?: ~a" (pure-rator? '+)))
+
+  ;;; (log-error (format "prim-knowns:")
+  ;;;            (for ([k (in-hash-keys prim-knowns)])
+  ;;;              (log-error (format "  ~a -> ~a" k (hash-ref prim-knowns k)))))
+  ;;;   ]
+  ;;; [`,_ (void)])
+
+  ;;; (displayln "impure ids:")
+  ;;; (for ([id (in-hash-keys impure-ids)])
+  ;;;   (displayln id))
+  ;;; (displayln "")
+
+  ;;; (displayln "expr2sym:")
+  ;;; (for ([expr (in-hash-keys expr2sym)])
+  ;;;   (displayln (format "~a -> ~a" expr (hash-ref expr2sym expr))))
+  ;;; (displayln "")
+
+  ;;; (displayln "sym2expr:")
+  ;;; (for ([sym (in-hash-keys sym2expr)])
+  ;;;   (displayln (format "~a -> ~a" sym (hash-ref sym2expr sym))))
+  ;;; (displayln "")
+
+  ;;; (displayln "sym-impure:")
+  ;;; (for ([sym (in-hash-keys sym-impure)])
+  ;;;   (displayln (format "~a -> ~a" sym (hash-ref sym-impure sym))))
+  ;;; (displayln "")
+
+  ;;; (displayln "sym2scp:")
+  ;;; (for ([sym (in-hash-keys sym2scp)])
+  ;;;   (displayln (format "~a -> ~a" sym (hash-ref sym2scp sym))))
+  ;;; (displayln "")
+
+  ;;; (displayln "sym-duplicate:")
+  ;;; (for ([sym (in-hash-keys sym-duplicate)])
+  ;;;   (displayln (format "~a -> ~a" sym (hash-ref sym-duplicate sym))))
+  ;;; (displayln "")
+
+  ;;; (displayln "scp2dupsyms:")
+  ;;; (for ([scp (in-hash-keys scp2dupsyms)])
+  ;;;   (displayln (format "~a -> ~a" scp (hash-ref scp2dupsyms scp))))
+  ;;; (displayln "")
+
+  ;;; (displayln "prim-knowns")
+  ;;; (for ([k (in-hash-keys prim-knowns)])
+  ;;;   (displayln (format "~a -> ~a" k (hash-ref prim-knowns k))))
+  ;;; (displayln "")
+
+  res
 
   )

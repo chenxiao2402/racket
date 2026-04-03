@@ -239,7 +239,7 @@
   ;; Mutated to communicate the final `knowns`
   (define final-knowns knowns)
   ;; Deep-unwrap correlated objects for printing
-  (define cse-l (apply-cse l))
+  (define cse-l (apply-cse l prim-knowns))
   ;; While schemifying, add calls to install exported values in to the
   ;; corresponding exported `variable` records, but delay those
   ;; installs to the end, if possible
